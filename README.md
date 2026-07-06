@@ -4,7 +4,7 @@
 
 This project examines the spatial distribution of firearm-related incidents across Toronto and investigates how neighbourhood-level socioeconomic characteristics are associated with firearm violence. Using spatial statistical methods, the analysis identifies geographic clustering of shootings, detects statistically significant hotspots and coldspots, and evaluates socioeconomic predictors while accounting for spatial dependence.
 
-![Hotspot Analysis](figures/fig7.png)
+![Hotspot Analysis](figures/fig1.png)
 
 The project was completed as part of **STA2016: Theory and Methods for Complex Spatial Data** at the **University of Toronto**.
 
