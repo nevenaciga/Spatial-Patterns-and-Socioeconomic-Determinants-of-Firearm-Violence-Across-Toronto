@@ -1,0 +1,1216 @@
+---
+title: "STA2016 Final Project"
+author: "Nevena Ciganovic"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
+# Libraries used throughout
+library(dplyr); library(readr); library(tidyr); library(stringr); library(janitor)
+library(sf); library(leaflet); library(htmltools); library(scales)
+
+# Key cleaner used for joining names
+clean_key <- function(x) {
+  x |>
+    as.character() |> str_squish() |>
+    stringi::stri_trans_general("Latin-ASCII") |>
+    tolower() |>
+    str_replace_all("&", " and ") |>
+    str_replace_all("[^a-z0-9]+", "_") |>
+    str_replace_all("^_|_$", "")
+}
+
+```
+
+## Proposal Code
+
+```{r build_points_and_polys, warning=F, message=F, include=F}
+setwd("/Users/nevenaciganovic/Downloads/STA2016/project")
+
+# --- Shootings (points) --------------------------------------------
+shoot <- read_csv(
+  "Shooting_and_Firearm_Discharges_Open_Data_-2630709695104719865.csv",
+  show_col_types = FALSE
+)
+
+stopifnot(all(c("LONG_WGS84","LAT_WGS84") %in% names(shoot)))
+
+shoot <- shoot |>
+  mutate(
+    LONG_WGS84 = suppressWarnings(as.numeric(LONG_WGS84)),
+    LAT_WGS84  = suppressWarnings(as.numeric(LAT_WGS84))
+  ) |>
+  filter(
+    is.finite(LONG_WGS84), is.finite(LAT_WGS84),
+    LONG_WGS84 > -90, LONG_WGS84 < -70,
+    LAT_WGS84  >  40, LAT_WGS84  <  50
+  )
+
+shoot_sf <- st_as_sf(
+  shoot, coords = c("LONG_WGS84","LAT_WGS84"),
+  crs = 4326, remove = FALSE
+)
+
+# --- Toronto Neighbourhoods (polygons) -----------------------------
+cand_paths <- c(
+  "Toronto_Neighbourhoods/Toronto_Neighbourhoods.shp",
+  "Toronto_Neighbourhoods.shp",
+  "~/Downloads/Toronto_Neighbourhoods/Toronto_Neighbourhoods.shp"
+)
+shp_path <- cand_paths[file.exists(path.expand(cand_paths))][1]
+if (is.na(shp_path)) stop("Could not find the Toronto Neighbourhoods shapefile.")
+
+neighbourhood <- st_read(shp_path, quiet = TRUE) |>
+  st_transform(4326)
+
+# Your shapefile's name field:
+name_col <- "Neighbourh"
+stopifnot(name_col %in% names(neighbourhood))
+
+# Add clean join key + pretty display name
+neighbourhood <- neighbourhood |>
+  mutate(
+    demo_name   = clean_key(.data[[name_col]]),
+    pretty_name = str_to_title(str_replace_all(demo_name, "_", " "))
+  )
+```
+
+```{r build_demo_keep,warning=F, message=F, include=FALSE}
+setwd("/Users/nevenaciganovic/Downloads/STA2016/project")
+
+# --- 2021 Neighbourhood Profiles → demo_keep -----------------------
+profiles <- read_csv("neighbourhood-profiles-2021-158-model.csv", show_col_types = FALSE) |>
+  clean_names()
+
+neigh_cols <- setdiff(names(profiles), "neighbourhood_name")
+
+long <- profiles |>
+  pivot_longer(all_of(neigh_cols), names_to = "neigh", values_to = "value_raw") |>
+  mutate(
+    indicator = str_to_lower(str_squish(neighbourhood_name)),
+    neigh     = str_to_lower(str_squish(neigh)),
+    value     = readr::parse_number(as.character(value_raw))
+  )
+
+unemp_tbl <- long |>
+  filter(str_detect(indicator, "^unemployment rate$")) |>
+  transmute(neigh, unemploy_rate = value)
+
+inc_tbl <- long |>
+  filter(str_detect(indicator, "^median total income of household in 2020")) |>
+  transmute(neigh, median_total_income = value)
+
+vismin_total <- long |>
+  filter(str_detect(indicator, "^total visible minority population$")) |>
+  transmute(neigh, vismin_total = value)
+
+not_vismin <- long |>
+  filter(str_detect(indicator, "^not a visible minority$")) |>
+  transmute(neigh, not_vismin = value)
+
+black_tbl <- long |>
+  filter(str_detect(indicator, "^black$")) |>
+  transmute(neigh, black_count = value)
+
+race <- vismin_total |>
+  full_join(not_vismin, by = "neigh") |>
+  full_join(black_tbl,  by = "neigh") |>
+  mutate(
+    population_total       = vismin_total + not_vismin,
+    pct_visible_minority   = if_else(population_total > 0, 100 * vismin_total / population_total, NA_real_),
+    pct_black              = if_else(population_total > 0, 100 * black_count   / population_total, NA_real_)
+  ) |>
+  select(neigh, population_total, pct_visible_minority, pct_black)
+
+demo_keep <- race |>
+  left_join(inc_tbl,  by = "neigh") |>
+  left_join(unemp_tbl, by = "neigh") |>
+  rename(demo_name = neigh) |>
+  mutate(demo_name = clean_key(demo_name)) |>
+  distinct(demo_name, .keep_all = TRUE)
+```
+
+```{r warning=F, message=F, echo=F}
+# --- Setup ---------------------------------------------------------
+setwd("/Users/nevenaciganovic/Downloads/STA2016/project")
+
+library(dplyr)
+library(readr)
+library(sf)
+library(leaflet)
+library(htmltools)
+
+# --- Load shootings (no year filtering) ---------------------------
+shoot <- read_csv(
+  "Shooting_and_Firearm_Discharges_Open_Data_-2630709695104719865.csv",
+  show_col_types = FALSE
+)
+
+stopifnot(all(c("LONG_WGS84", "LAT_WGS84") %in% names(shoot)))
+shoot <- shoot |>
+  filter(
+    LONG_WGS84 > -90 & LONG_WGS84 < -70,
+    LAT_WGS84  >  40 & LAT_WGS84  <  50
+  )
+
+shoot_sf <- st_as_sf(
+  shoot,
+  coords = c("LONG_WGS84", "LAT_WGS84"),
+  crs = 4326,
+  remove = FALSE
+)
+
+# --- Load Toronto Neighbourhoods (polygons) -----------------------
+cand_paths <- c(
+  "Toronto_Neighbourhoods/Toronto_Neighbourhoods.shp",
+  "Toronto_Neighbourhoods.shp",
+  "~/Downloads/Toronto_Neighbourhoods/Toronto_Neighbourhoods.shp"
+)
+shp_path <- cand_paths[file.exists(path.expand(cand_paths))][1]
+if (is.na(shp_path)) stop("Could not find the Toronto Neighbourhoods shapefile.")
+
+neighbourhood <- st_read(shp_path, quiet = TRUE) |> st_transform(4326)
+
+# Prefer a NAME-like field (not IDs)
+name_candidates <- c(
+  "Neighbourh","NEIGHBOURH","NEIGHBOURHOOD","NEIGHBOURHOOD_NAME",
+  "AREA_NAME","AREA_NAME_1","NAME","Name"
+)
+nm_col <- intersect(name_candidates, names(neighbourhood))
+if (length(nm_col) == 0) {
+  # fallback to first non-geometry column
+  nm_col <- setdiff(names(neighbourhood), attr(neighbourhood, "sf_column"))[1]
+} else {
+  nm_col <- nm_col[1]
+}
+
+lab_neigh <- ~htmlEscape(get(nm_col))
+
+# --- Map with layer toggles ---------------------------------------
+leaflet(options = leafletOptions(preferCanvas = TRUE)) |>
+  addTiles(group = "Base") |>
+
+  # Neighbourhood boundaries (hover shows NAME)
+  addPolygons(
+    data = neighbourhood, group = "Neighbourhoods",
+    label = lab_neigh,
+    weight = 1, color = "#666666",
+    fillColor = "#e6f2ff", fillOpacity = 0.15,
+    highlightOptions = highlightOptions(weight = 2, color = "#333333", bringToFront = TRUE),
+    labelOptions = labelOptions(
+      style = list("font-weight" = "600"),
+      textsize = "13px",
+      direction = "auto"
+    )
+  ) |>
+
+  # Shooting points
+  addCircleMarkers(
+    data  = shoot_sf, group = "Shootings",
+    radius = 4, stroke = FALSE, fillOpacity = 0.7,
+    fillColor = "red"
+  ) |>
+
+  # Layer control
+  addLayersControl(
+    baseGroups    = c("Base"),
+    overlayGroups = c("Neighbourhoods", "Shootings"),
+    options = layersControlOptions(collapsed = FALSE)
+  ) |>
+
+  # Fit to neighbourhood extent (stable and tidy)
+  fitBounds(
+    lng1 = st_bbox(neighbourhood)[["xmin"]], lat1 = st_bbox(neighbourhood)[["ymin"]],
+    lng2 = st_bbox(neighbourhood)[["xmax"]], lat2 = st_bbox(neighbourhood)[["ymax"]]
+  )
+
+```
+
+```{r message=FALSE, warning=FALSE, echo=F}
+library(dplyr)
+library(sf)
+library(stringr)
+library(stringi)
+library(tidyr)
+library(leaflet)
+library(htmltools)
+library(scales)
+
+# --- 1) One cleaning function used everywhere ----------------------
+clean_key <- function(x) {
+  x %>%
+    as.character() %>%
+    str_squish() %>%
+    stringi::stri_trans_general("Latin-ASCII") %>%  # strip accents
+    tolower() %>%
+    str_replace_all("&", " and ") %>%
+    str_replace_all("[^a-z0-9]+", "_") %>%
+    str_replace_all("^_|_$", "")
+}
+
+# --- 2) Build keys on BOTH sides ----------------------------------
+name_col <- "Neighbourh"   # from your shapefile
+neighbourhood <- neighbourhood %>%
+  mutate(
+    demo_name   = clean_key(.data[[name_col]]),
+    pretty_name = str_to_title(str_replace_all(demo_name, "_", " "))
+  )
+
+demo_keep <- demo_keep %>%
+  mutate(demo_name = clean_key(demo_name)) %>%   # ensure same key format
+  distinct(demo_name, .keep_all = TRUE)
+
+# --- 3) Join demographics to polygons -----------------------------
+neigh_demo <- neighbourhood %>%
+  left_join(demo_keep, by = "demo_name")
+
+# Optional: fallback to shapefile population if CSV didn’t match
+if ("Total_Popu" %in% names(neigh_demo)) {
+  neigh_demo <- neigh_demo %>%
+    mutate(population_total = coalesce(population_total, as.numeric(Total_Popu)))
+}
+
+# --- 4) Count shootings by neighbourhood (spatial join) -----------
+shoot_sf   <- st_transform(shoot_sf, st_crs(neigh_demo))
+neigh_demo <- st_make_valid(neigh_demo)
+
+shoot_counts <- st_join(
+  shoot_sf,
+  neigh_demo["demo_name"],
+  join = st_within,
+  left = FALSE
+) %>%
+  st_drop_geometry() %>%
+  count(demo_name, name = "shootings_n")
+
+neigh_demo <- neigh_demo %>%
+  left_join(shoot_counts, by = "demo_name") %>%
+  mutate(
+    shootings_n  = replace_na(shootings_n, 0),
+    rate_per_10k = if_else(is.finite(population_total) & population_total > 0,
+                           10000 * shootings_n / population_total,
+                           NA_real_)
+  )
+
+# --- 5) Choropleth (quintiles) ------------------------------------
+pal <- colorQuantile(
+  palette  = "YlOrRd",
+  domain   = neigh_demo$rate_per_10k,
+  n        = 5,
+  na.color = "#BDBDBD"
+)
+
+popup_poly <- sprintf(
+  "<b>%s</b><br/>Shootings: %s<br/>Population: %s<br/>Rate/10,000: %s",
+  neigh_demo$pretty_name,
+  comma(neigh_demo$shootings_n),
+  ifelse(is.na(neigh_demo$population_total), "NA", comma(neigh_demo$population_total)),
+  ifelse(is.finite(neigh_demo$rate_per_10k), sprintf('%.2f', neigh_demo$rate_per_10k), "NA")
+) |> lapply(HTML)
+
+leaflet(neigh_demo, options = leafletOptions(preferCanvas = TRUE)) |>
+  addTiles() |>
+  addPolygons(
+    fillColor   = ~pal(rate_per_10k),
+    fillOpacity = 0.75,
+    color       = "#555555",
+    weight      = 1,
+    opacity     = 0.9,
+    label       = ~pretty_name,   # name on hover
+    labelOptions = labelOptions(textsize = "12px", direction = "auto",
+                                style = list("font-weight" = "600")),
+    popup       = popup_poly,
+    highlightOptions = highlightOptions(weight = 2, color = "#000", bringToFront = TRUE)
+  ) |>
+  addLegend(
+    pal    = pal,
+    values = ~rate_per_10k,
+    title  = "Shootings per 10,000 (quintiles)",
+    position = "bottomright",
+    opacity = 0.8,
+    labFormat = labelFormat(digits = 2)
+  ) |>
+  fitBounds(
+    lng1 = st_bbox(neigh_demo)[["xmin"]], lat1 = st_bbox(neigh_demo)[["ymin"]],
+    lng2 = st_bbox(neigh_demo)[["xmax"]], lat2 = st_bbox(neigh_demo)[["ymax"]]
+  )
+
+
+```
+
+```{r message=F, warning=F, echo=F}
+setwd("/Users/nevenaciganovic/Downloads/STA2016/project")
+
+library(dplyr)
+library(readr)
+library(tidyr)
+library(stringr)
+library(janitor)
+library(gt)
+library(scales)
+
+profiles <- read_csv("neighbourhood-profiles-2021-158-model.csv", show_col_types = FALSE) |>
+  clean_names()
+
+# Wide → long
+neigh_cols <- setdiff(names(profiles), "neighbourhood_name")
+long <- profiles |>
+  pivot_longer(all_of(neigh_cols), names_to = "neigh", values_to = "value_raw") |>
+  mutate(
+    indicator = str_to_lower(str_squish(neighbourhood_name)),
+    neigh     = str_to_lower(str_squish(neigh)),
+    value     = readr::parse_number(as.character(value_raw))
+  )
+
+# --- Exact row picks based on your grep output ---
+# Unemployment rate
+unemp_tbl <- long |>
+  filter(str_detect(indicator, "^unemployment rate$")) |>
+  transmute(neigh, unemploy_rate = value)
+
+# Median household income (2020) — per 2021 Census
+inc_tbl <- long |>
+  filter(str_detect(indicator, "^median total income of household in 2020")) |>
+  transmute(neigh, median_total_income = value)
+
+# Visible minority components (to build population + %s)
+vismin_total <- long |>
+  filter(str_detect(indicator, "^total visible minority population$")) |>
+  transmute(neigh, vismin_total = value)
+
+not_vismin <- long |>
+  filter(str_detect(indicator, "^not a visible minority$")) |>
+  transmute(neigh, not_vismin = value)
+
+black_tbl <- long |>
+  filter(str_detect(indicator, "^black$")) |>
+  transmute(neigh, black_count = value)
+
+# Build population (private households) + %VM + %Black
+race <- vismin_total |>
+  full_join(not_vismin, by = "neigh") |>
+  full_join(black_tbl, by = "neigh") |>
+  mutate(
+    population_total       = vismin_total + not_vismin,
+    pct_visible_minority   = if_else(population_total > 0, 100 * vismin_total / population_total, NA_real_),
+    pct_black              = if_else(population_total > 0, 100 * black_count   / population_total, NA_real_)
+  ) |>
+  select(neigh, population_total, pct_visible_minority, pct_black)
+
+# Final demographics table for join
+demo_keep <- race |>
+  left_join(inc_tbl,  by = "neigh") |>
+  left_join(unemp_tbl, by = "neigh") |>
+  rename(demo_name = neigh) |>
+  select(demo_name, population_total, median_total_income, unemploy_rate, pct_visible_minority, pct_black)
+
+# Make pretty table
+demo_tbl <- demo_keep %>%
+  # Keep only needed columns in the right order
+  select(
+    neighbourhood = demo_name,
+    population_total,
+    median_total_income,
+    unemploy_rate,
+    pct_visible_minority,
+    pct_black
+  ) %>%
+  # Fix names (underscores → spaces, title case)
+  mutate(
+    neighbourhood = str_replace_all(neighbourhood, "_", " "),
+    neighbourhood = str_to_title(neighbourhood)
+  )
+
+gt(demo_tbl) %>%
+  tab_header(
+    title = md("**Toronto Neighbourhood Demographics (2021)**"),
+    subtitle = md("Selected indicators from the 2021 Census")
+  ) %>%
+  cols_label(
+    neighbourhood        = "Neighbourhood",
+    population_total     = "Population",
+    median_total_income  = "Median HH Income (2020, $)",
+    unemploy_rate        = "Unemployment Rate (%)",
+    pct_visible_minority = "Visible Minority (%)",
+    pct_black            = "Black (%)"
+  ) %>%
+  fmt_number(columns = c(population_total), sep_mark = ",", decimals = 0) %>%
+  fmt_currency(columns = c(median_total_income), currency = "CAD", decimals = 0) %>%
+  fmt_number(columns = c(unemploy_rate, pct_visible_minority, pct_black), decimals = 1) %>%
+  tab_spanner(
+    label = "Race / Ethnicity",
+    columns = c(pct_visible_minority, pct_black)
+  ) %>%
+  opt_row_striping() %>%
+  tab_options(
+    table.width = px(900),
+    data_row.padding = px(6)
+  ) %>%
+  tab_source_note(md("Source: City of Toronto Neighbourhood Profiles (2021)."))
+
+```
+
+## RQ1: Are firearm violence incidents spatially clustered across Toronto, or consistent with complete spatial randomness (CSR)?
+
+
+```{r packages, message=FALSE, warning=FALSE, echo=FALSE}
+set.seed(123)
+library(sf)
+library(dplyr)
+library(spatstat.geom)
+library(spatstat.explore)
+library(spatstat.model)
+```
+
+### Build a `ppp` point pattern in meters
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE}
+# Project to meters (Toronto: UTM 17N is usually fine)
+crs_m <- 26917
+
+W_sf <- neighbourhood |> st_transform(crs_m) |> st_union() |> st_as_sf()
+X_sf <- shoot_sf      |> st_transform(crs_m)
+
+# Convert to spatstat window + points
+W_owin <- as.owin(W_sf)
+xy     <- st_coordinates(X_sf)
+
+# Keep only points inside window
+inside <- inside.owin(xy[,1], xy[,2], W_owin)
+xy_in  <- xy[inside, , drop = FALSE]
+
+# Create ppp object
+X_ppp <- ppp(x = xy_in[,1], y = xy_in[,2], window = W_owin)
+
+# Jitter duplicated points by a tiny amount (1 meter)
+X_ppp <- rjitter(X_ppp, retry = TRUE, radius = 1)
+
+# Check duplicates are gone
+any(duplicated(cbind(X_ppp$x, X_ppp$y)))
+
+# Plot
+plot(X_ppp,
+     main = "Point Pattern of Shootings (projected, meters)",
+     pch = 16, cex = 0.4)
+
+```
+
+### Are incidents clustered beyond complete spatial randomness?
+
+Test for CSR using Ripley's K and G function.
+
+```{r}
+library(spatstat.explore)
+set.seed(123)
+
+nsim <- 39
+
+# -----------------------------
+# L(r)-r CSR envelope
+# -----------------------------
+rmax <- diameter(Window(X_ppp))/4
+rvec <- seq(0, rmax, length.out = 64)
+
+L_env <- envelope(
+  X_ppp,
+  fun = Lest,
+  nsim = nsim,
+  global = TRUE,
+  r = rvec,
+  correction = "border",
+  verbose = FALSE
+)
+
+plot(L_env, . - r ~ r,
+     main = "CSR test: L(r) - r (global Monte Carlo envelope)",
+     xlab = "r (meters)",
+     ylab = "L(r) - r",
+     legend = FALSE)
+abline(h = 0, lty = 2)
+
+# -----------------------------
+# G(r) CSR envelope
+# (choose r based on NN distances)
+# -----------------------------
+nn <- nndist(X_ppp)
+rmax_g <- as.numeric(quantile(nn, 0.95))     # show up to 95% of NN distances
+rvec_g <- seq(0, rmax_g, length.out = 64)
+
+G_env <- envelope(
+  X_ppp,
+  fun = Gest,
+  nsim = nsim,
+  global = TRUE,
+  r = rvec_g,
+  correction = "rs",
+  verbose = FALSE
+)
+
+plot(G_env,
+     main = "CSR test: G(r) (global Monte Carlo envelope)",
+     xlab = "r (meters)",
+     ylab = "G(r)",
+     legend = FALSE)
+
+
+```
+
+Formal MAD test.
+```{r}
+library(spatstat.explore)
+
+mad_out <- mad.test(
+  X_ppp, fun = Lest,
+  nsim = nsim,
+  rinterval  = c(0, rmax),
+  correction = "border",
+  simulate   = expression(runifpoint(npoints(X_ppp), win = X_ppp$window))
+)
+mad_out
+
+```
+
+Conclusion: CSR is rejected. There is clear spatial clustering under CSR.
+
+
+```{r}
+library(spatstat.explore)
+library(viridis)
+
+# Data-driven bandwidth
+sig_default <- bw.diggle(X_ppp)
+sig_default
+
+sigmas <- c(sig_default, 500, 2000)
+names(sigmas) <- c("bw.diggle", "500m", "2000m")
+
+par(mfrow = c(1, 3), mar = c(2, 2, 3, 5))
+
+for (i in seq_along(sigmas)) {
+
+  kde_im <- density.ppp(
+    X_ppp,
+    sigma = sigmas[i],
+    edge  = TRUE,
+    at    = "pixels",
+    dimyx = 256
+  )
+
+  plot(kde_im,
+       main = paste("KDE (σ =", round(sigmas[i], 1), "m)"),
+       col  = viridis(256))
+
+  plot(X_ppp, add = TRUE, pch = 16, cex = 0.2)
+}
+
+par(mfrow = c(1, 1))
+
+
+```
+```{r}
+library(spatstat.explore)
+library(viridis)
+
+# -----------------------------
+# 1) Chosen bandwidth (automatic)
+# -----------------------------
+sig_default <- bw.diggle(X_ppp)
+sig_default
+
+kde_default <- density.ppp(
+  X_ppp,
+  sigma = sig_default,
+  edge  = TRUE,
+  at    = "pixels",
+  dimyx = 256
+)
+
+plot(kde_default,
+     main = paste("KDE of Firearm Incidents (σ =", round(sig_default, 1), "m)"),
+     col  = viridis(256))
+plot(X_ppp, add = TRUE, pch = 16, cex = 0.2)
+
+# -----------------------------
+# 2) KDE with σ = 500 m
+# -----------------------------
+kde_500 <- density.ppp(
+  X_ppp,
+  sigma = 500,
+  edge  = TRUE,
+  at    = "pixels",
+  dimyx = 256
+)
+
+plot(kde_500,
+     main = "KDE of Firearm Incidents (σ = 500 m)",
+     col  = viridis(256))
+plot(X_ppp, add = TRUE, pch = 16, cex = 0.2)
+
+# -----------------------------
+# 3) KDE with σ = 2000 m
+# -----------------------------
+kde_2000 <- density.ppp(
+  X_ppp,
+  sigma = 2000,
+  edge  = TRUE,
+  at    = "pixels",
+  dimyx = 256
+)
+
+plot(kde_2000,
+     main = "KDE of Firearm Incidents (σ = 2000 m)",
+     col  = viridis(256))
+plot(X_ppp, add = TRUE, pch = 16, cex = 0.2)
+
+```
+
+
+## RQ2: How do firearm violence rates vary across community districts, and are there statistically significant high-crime “hotspots” and low-crime “coldspots”?
+
+```{r}
+# =========================================================
+# RQ2 Step 0: Outcome + Queen/Rook/kNN weights
+# =========================================================
+library(sf)
+library(spdep)
+library(dplyr)
+
+# Outcome
+y_var <- "rate_per_10k"
+stopifnot(y_var %in% names(neigh_demo))
+
+# Project for neighborhood structures
+crs_m <- 26917
+neigh_m <- neigh_demo |> st_transform(crs_m) |> st_make_valid()
+geom <- st_geometry(neigh_m)
+coords <- st_coordinates(st_centroid(geom))
+
+# Outcome vector
+y <- as.numeric(neigh_m[[y_var]])
+stopifnot(length(y) == nrow(neigh_m))
+
+# Build weights
+nb_queen <- poly2nb(geom, queen = TRUE)
+lw_queen <- nb2listw(nb_queen, style = "W", zero.policy = TRUE)
+
+nb_rook  <- poly2nb(geom, queen = FALSE)
+lw_rook  <- nb2listw(nb_rook,  style = "W", zero.policy = TRUE)
+
+k <- 18
+nb_knn_raw <- knn2nb(knearneigh(coords, k = k))
+nb_knn <- make.sym.nb(nb_knn_raw)
+lw_knn <- nb2listw(nb_knn, style = "W", zero.policy = TRUE)
+
+# Diagnostics (like A3)
+deg <- function(nb) sapply(nb, length)
+cat("Avg degree — Queen:", mean(deg(nb_queen)),
+    "| Rook:", mean(deg(nb_rook)),
+    "| kNN:", mean(deg(nb_knn)), "\n")
+cat("Connected components — Queen:", n.comp.nb(nb_queen)$nc,
+    "| Rook:", n.comp.nb(nb_rook)$nc,
+    "| kNN:", n.comp.nb(nb_knn)$nc, "\n")
+
+# Compare global Moran I across structures (A3 Q3 style)
+global_moran <- function(y, lw, label) {
+  mt <- moran.test(y, lw, randomisation = FALSE, zero.policy = TRUE)
+  tibble(
+    weights = label,
+    I  = unname(mt$estimate[["Moran I statistic"]]),
+    EI = unname(mt$estimate[["Expectation"]]),
+    p_value = mt$p.value
+  )
+}
+
+global_tbl <- bind_rows(
+  global_moran(y, lw_queen, "Queen"),
+  global_moran(y, lw_rook,  "Rook"),
+  global_moran(y, lw_knn,   paste0("kNN (k=", k, ")"))
+)
+
+print(global_tbl)
+
+# =========================================================
+# RQ2 Step 3: Plot neighborhood graphs (A3 style)
+# =========================================================
+
+plot(geom, border = "grey80", main = "Queen contiguity")
+plot(nb_queen, coords, add = TRUE, col = "#d81b60")
+
+plot(geom, border = "grey80", main = "Rook contiguity")
+plot(nb_rook, coords, add = TRUE, col = "#1f78b4")
+
+plot(geom, border = "grey80", main = paste0(k, "-NN"))
+plot(nb_knn, coords, add = TRUE, col = "#33a02c")
+
+
+```
+```{r}
+# Preferred weights for the rest of RQ2:
+w <- lw_queen    # change to lw_queen or lw_knn if you prefer
+w_nb <- nb_queen # matching nb object (needed for Gi* binary weights)
+
+```
+
+```{r}
+# =========================================================
+# RQ2 Q6a: Moran scatterplot (shooting rate per 10k)
+# =========================================================
+library(ggplot2)
+library(ggrepel)
+
+u <- y  # just to mirror A3 notation (u = outcome)
+name_col <- if ("Neighbourh" %in% names(neigh_demo)) "Neighbourh" else "pretty_name"
+
+# Local Moran (LISA)
+lisa <- as.data.frame(localmoran(u, w, zero.policy = TRUE))
+
+# robustly find p-value column
+pcol <- grep("^Pr\\(", names(lisa), value = TRUE)[1]
+names(lisa)[names(lisa) == pcol] <- "p_value"
+if (!"Ii" %in% names(lisa)) names(lisa)[1] <- "Ii"
+
+# Moran scatterplot pieces
+z  <- as.numeric(scale(u))
+Wz <- lag.listw(w, z, zero.policy = TRUE)
+I_global <- unname(moran.test(u, w, randomisation = FALSE, zero.policy = TRUE)$estimate[["Moran I statistic"]])
+
+df_scatter <- neigh_demo |>
+  st_drop_geometry() |>
+  transmute(
+    name = .data[[name_col]],
+    z = z,
+    Wz = Wz
+  ) |>
+  bind_cols(lisa["p_value"]) |>
+  mutate(
+    quad = case_when(
+      z >= 0 & Wz >= 0 ~ "HH",
+      z <  0 & Wz <  0 ~ "LL",
+      z >= 0 & Wz <  0 ~ "HL",
+      TRUE             ~ "LH"
+    ),
+    sig = p_value < 0.05
+  )
+
+# Label significant HL/LH (spatial outliers); otherwise label top 6 residuals
+lab_dat <- df_scatter |> filter(sig & quad %in% c("HL","LH"))
+if (nrow(lab_dat) == 0) {
+  lab_dat <- df_scatter |>
+    mutate(resid = Wz - I_global * z) |>
+    slice_max(order_by = abs(resid), n = 6)
+}
+
+ggplot(df_scatter, aes(x = z, y = Wz)) +
+  geom_hline(yintercept = 0, linewidth = 0.6, linetype = 2, color = "grey40") +
+  geom_vline(xintercept = 0, linewidth = 0.6, linetype = 2, color = "grey40") +
+  geom_point(alpha = 0.8) +
+  geom_abline(intercept = 0, slope = I_global, color = "firebrick", linewidth = 1) +
+  geom_text_repel(
+    data = lab_dat,
+    aes(label = name),
+    size = 3.2, min.segment.length = 0.1, box.padding = 0.3, max.overlaps = 30
+  ) +
+  labs(
+    title = "Moran Scatterplot of Shooting Rate per 10k",
+    subtitle = paste0("Global Moran’s I (slope) = ", sprintf("%.3f", I_global)),
+    x = "Standardized shooting rate (z)",
+    y = "Spatial lag Wz"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+
+```{r}
+# =========================================================
+# RQ2 Q6c: LISA quadrant map (sig vs non-sig)
+# =========================================================
+library(ggplot2)
+
+# lisa_df MUST have the same ordering as neigh_demo / neigh_m used for weights
+lisa_df <- tibble(
+  demo_name = neigh_demo |> st_drop_geometry() |> pull(demo_name),
+  Ii   = lisa_mat[, "Ii"],
+  Z_Ii = lisa_mat[, "Z.Ii"],
+  p_value = 2 * pnorm(-abs(lisa_mat[, "Z.Ii"]))
+) |>
+  mutate(p_adj = p.adjust(p_value, method = "holm"))
+
+library(dplyr)
+library(ggplot2)
+
+lisa_sf <- neigh_demo |>
+  mutate(z = z, Wz = Wz) |>
+  left_join(lisa_df, by = "demo_name") |>
+  mutate(
+    sig = p_adj < 0.05,
+    quad = case_when(
+      z >= 0 & Wz >= 0 ~ "HH",
+      z <  0 & Wz <  0 ~ "LL",
+      z >= 0 & Wz <  0 ~ "HL",
+      TRUE             ~ "LH"
+    ),
+    cluster = paste0(quad, ifelse(sig, " (sig)", " (ns)")),
+    cluster = factor(cluster,
+      levels = c("HH (sig)","LL (sig)","HL (sig)","LH (sig)",
+                 "HH (ns)","LL (ns)","HL (ns)","LH (ns)")
+    )
+  )
+
+pal <- c(
+  "HH (sig)" = "#b2182b",
+  "LL (sig)" = "#2166ac",
+  "HL (sig)" = "#ef8a62",
+  "LH (sig)" = "#67a9cf",
+  "HH (ns)"  = "#cccccc",
+  "LL (ns)"  = "#bfbfbf",
+  "HL (ns)"  = "#d9d9d9",
+  "LH (ns)"  = "#e6e6e6"
+)
+
+ggplot(lisa_sf) +
+  geom_sf(aes(fill = cluster, alpha = ifelse(sig, 1, 0.35)),
+          color = "white", linewidth = 0.2) +
+  scale_fill_manual(values = pal, name = "LISA clusters") +
+  scale_alpha_identity() +
+  labs(
+    title = "Local Moran’s I (LISA) for Shooting Rate per 10k",
+    subtitle = "Holm-adjusted p < 0.05 shown in full opacity"
+  ) +
+  theme_void(base_size = 12) +
+  theme(legend.position = "right")
+
+```
+
+```{r}
+# =========================================================
+# RQ2 Q7a: Getis-Ord Gi* scatterplot (binary weights)
+# =========================================================
+library(ggplot2)
+library(ggrepel)
+
+# Binary weights for Gi*
+lw_bin <- nb2listw(w_nb, style = "B", zero.policy = TRUE)
+
+GiZ <- as.numeric(localG(u, lw_bin, zero.policy = TRUE))
+
+gstar_df <- tibble(
+  name = neigh_demo |> st_drop_geometry() |> pull(.data[[name_col]]),
+  z = z,
+  GiZ = GiZ
+) |>
+  mutate(
+    sig = abs(GiZ) > 1.96,
+    cluster = case_when(
+      GiZ >  1.96 ~ "Hot spot (High–High)",
+      GiZ < -1.96 ~ "Cold spot (Low–Low)",
+      TRUE ~ "Not significant"
+    )
+  )
+
+ggplot(gstar_df, aes(x = z, y = GiZ, color = cluster)) +
+  geom_hline(yintercept = c(-1.96, 1.96), linetype = "dashed", color = "grey40") +
+  geom_point(size = 3, alpha = 0.9) +
+  geom_text_repel(
+    data = gstar_df |> filter(sig | abs(GiZ) > 2.5),
+    aes(label = name),
+    size = 3.2,
+    max.overlaps = 60
+  ) +
+  scale_color_manual(values = c(
+    "Hot spot (High–High)"  = "#d73027",
+    "Cold spot (Low–Low)"  = "#4575b4",
+    "Not significant"      = "grey70"
+  )) +
+  labs(
+    x = "Standardized shooting rate (z)",
+    y = "Local Getis–Ord Gi* (z-score)",
+    color = "Cluster type",
+    title = "Getis–Ord Gi* Hot- and Cold-Spot Detection (Shooting rate per 10k)"
+  ) +
+  theme_minimal(base_size = 14)
+
+# Optional: list significant
+gstar_df |> filter(sig) |> arrange(desc(GiZ))
+
+```
+
+```{r}
+# =========================================================
+# RQ2 Q7b: Gi* map (diverging palette; sig highlighted)
+# =========================================================
+library(ggplot2)
+
+tor_gstar <- neigh_demo |>
+  mutate(
+    GiZ = GiZ,
+    sig = abs(GiZ) > 1.96
+  )
+
+ggplot(tor_gstar) +
+  geom_sf(aes(fill = GiZ, alpha = sig), color = "white", linewidth = 0.25) +
+  scale_fill_distiller(type = "div", palette = "RdBu", direction = -1,
+                       name = "Gi* (z-score)") +
+  scale_alpha_manual(values = c(`TRUE` = 1, `FALSE` = 0.4), guide = "none") +
+  labs(
+    title = "Local Getis–Ord Gi* Hot and Cold Spots (Shooting rate per 10k)",
+    subtitle = "Red = hot spots (high-rate clusters), Blue = cold spots (low-rate clusters)\nSignificant (|z|>1.96) shown in full opacity",
+    caption = paste0("Weights: binary ", if (identical(w_nb, nb_rook)) "Rook" else if (identical(w_nb, nb_queen)) "Queen" else paste0("kNN (k=",k,")"))
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid = element_blank(),
+        legend.position = "right")
+
+```
+
+### RQ3: How are firearm violence rates associated with neighborhood socioeconomic characteristics after accounting for spatial dependence?
+
+```{r}
+# =========================================================
+# RQ3 Setup: data + X's + Queen weights
+# =========================================================
+library(sf)
+library(dplyr)
+library(spdep)
+library(spatialreg)
+library(ggplot2)
+
+# 1) Work in projected CRS for geometry operations (weights already built from polygons)
+crs_m <- 26917
+tor_sf <- neigh_demo |> st_transform(crs_m) |> st_make_valid()
+
+# 2) Outcome
+stopifnot("rate_per_10k" %in% names(tor_sf))
+tor_sf$y <- tor_sf$rate_per_10k
+
+# 3) Choose predictors (EDIT these names to match your columns)
+#    Use proportions where appropriate.
+#    Example: pct_visible_minority already a percent; can keep as % or /100, just be consistent.
+stopifnot(all(c("median_total_income","unemploy_rate","pct_visible_minority","pct_black","population_total") %in% names(tor_sf)))
+
+tor_sf <- tor_sf |>
+  mutate(
+    log_pop = log(population_total),
+    vm_prop = pct_visible_minority / 100,
+    black_prop = pct_black / 100
+  )
+
+# 4) Global formula used for all models
+form_rq3 <- y ~ median_total_income + unemploy_rate + vm_prop + black_prop + log_pop
+
+# 5) Spatial weights (Queen) from your RQ2 choice
+lw <- lw_queen              # row-standardized for SAR models
+nb <- nb_queen
+lwB <- nb2listw(nb, style="B", zero.policy = TRUE)  # binary weights (often used for CAR + some diagnostics)
+
+```
+```{r}
+map_resid <- function(sf_obj, resid_col, title){
+  ggplot(sf_obj) +
+    geom_sf(aes(fill = .data[[resid_col]]), color="white", linewidth=0.15) +
+    scale_fill_viridis_c(option="magma") +
+    labs(title = title, fill="Residual") +
+    theme_minimal() +
+    theme(panel.grid = element_blank())
+}
+
+```
+
+
+
+```{r}
+# =========================================================
+# RQ3: Socioeconomic predictors + spatial models
+# Outcome: shooting rate per 10k
+# Models: OLS, SAR Error, SAR Lag, SAC, CAR
+# Fix: impute missing covariates so ALL neighbourhoods are coloured
+# =========================================================
+
+suppressPackageStartupMessages({
+  library(sf)
+  library(dplyr)
+  library(spdep)
+  library(spatialreg)
+  library(ggplot2)
+  library(tibble)
+})
+
+# ---------------------------------------------------------
+# 0) Setup: data, variables, CRS
+# ---------------------------------------------------------
+crs_m <- 26917
+tor_sf <- neigh_demo |> st_transform(crs_m) |> st_make_valid()
+
+stopifnot("rate_per_10k" %in% names(tor_sf))
+tor_sf$y <- tor_sf$rate_per_10k
+
+# REQUIRED predictors (edit if your names differ)
+vars_raw <- c(
+  "median_total_income",
+  "unemploy_rate",
+  "pct_visible_minority",
+  "pct_black",
+  "population_total"
+)
+stopifnot(all(vars_raw %in% names(tor_sf)))
+
+# ---------------------------------------------------------
+# 1) Impute missing predictors (MEDIAN) so we keep ALL rows
+# ---------------------------------------------------------
+tor_sf <- tor_sf |>
+  mutate(across(
+    all_of(vars_raw),
+    ~ ifelse(is.na(.x), median(.x, na.rm = TRUE), .x)
+  )) |>
+  mutate(
+    log_pop    = log(population_total),
+    vm_prop    = pct_visible_minority / 100,
+    black_prop = pct_black / 100
+  )
+
+# Global formula (same for every model)
+form_rq3 <- y ~ median_total_income + unemploy_rate + vm_prop + black_prop + log_pop
+
+# ---------------------------------------------------------
+# 2) Spatial weights: Queen (build from SAME tor_sf)
+# ---------------------------------------------------------
+nb_queen  <- poly2nb(st_geometry(tor_sf), queen = TRUE)
+lw_queen  <- nb2listw(nb_queen, style = "W", zero.policy = TRUE)  # SAR (row-standardized)
+lwB_queen <- nb2listw(nb_queen, style = "B", zero.policy = TRUE)  # CAR (binary)
+
+cat("RQ3 rows (kept):", nrow(tor_sf), "\n")
+
+# ---------------------------------------------------------
+# 3) Helpers: residual map + Moran test on residuals
+# ---------------------------------------------------------
+map_resid <- function(sf_obj, resid_col, title){
+  ggplot(sf_obj) +
+    geom_sf(aes(fill = .data[[resid_col]]), color = "white", linewidth = 0.15) +
+    scale_fill_viridis_c(option = "magma") +
+    labs(title = title, fill = "Residual") +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid = element_blank())
+}
+
+# =========================================================
+# (a) OLS
+# =========================================================
+mod_lm <- lm(form_rq3, data = st_drop_geometry(tor_sf))
+print(summary(mod_lm))
+
+tor_sf$lm_resid <- as.numeric(residuals(mod_lm))
+
+moran_lm <- moran.test(tor_sf$lm_resid, lw_queen, zero.policy = TRUE)
+print(moran_lm)
+
+map_resid(tor_sf, "lm_resid", "OLS Residuals")
+
+# =========================================================
+# (b) SAR Spatial Error (SEM)
+# =========================================================
+mod_sem <- errorsarlm(
+  formula = form_rq3,
+  data    = st_drop_geometry(tor_sf),
+  listw   = lw_queen,
+  zero.policy = TRUE
+)
+print(summary(mod_sem))
+
+tor_sf$sem_resid <- as.numeric(residuals(mod_sem))
+
+moran_sem <- moran.test(tor_sf$sem_resid, lw_queen, zero.policy = TRUE)
+print(moran_sem)
+
+map_resid(tor_sf, "sem_resid", "SAR Error Residuals")
+
+# =========================================================
+# (c) SAR Spatial Lag (SLM)
+# =========================================================
+mod_slm <- lagsarlm(
+  formula = form_rq3,
+  data    = st_drop_geometry(tor_sf),
+  listw   = lw_queen,
+  zero.policy = TRUE
+)
+print(summary(mod_slm))
+
+tor_sf$slm_resid <- as.numeric(residuals(mod_slm))
+
+moran_slm <- moran.test(tor_sf$slm_resid, lw_queen, zero.policy = TRUE)
+print(moran_slm)
+
+map_resid(tor_sf, "slm_resid", "SAR Lag Residuals")
+
+# =========================================================
+# (d) SAR Spatial Lag–Error (SAC)
+# =========================================================
+mod_sac <- sacsarlm(
+  formula = form_rq3,
+  data    = st_drop_geometry(tor_sf),
+  listw   = lw_queen,
+  zero.policy = TRUE
+)
+print(summary(mod_sac))
+
+tor_sf$sac_resid <- as.numeric(residuals(mod_sac))
+
+moran_sac <- moran.test(tor_sf$sac_resid, lw_queen, zero.policy = TRUE)
+print(moran_sac)
+
+map_resid(tor_sf, "sac_resid", "SAR Lag–Error Residuals")
+
+# =========================================================
+# (e) CAR (spautolm, CAR family) — needs BINARY weights
+# =========================================================
+mod_car <- spautolm(
+  formula = form_rq3,
+  data    = st_drop_geometry(tor_sf),
+  listw   = lwB_queen,
+  family  = "CAR",
+  zero.policy = TRUE,
+  tol.solve = 1e-30
+)
+print(summary(mod_car))
+
+tor_sf$car_resid <- as.numeric(residuals(mod_car))
+
+# Moran’s I on CAR residuals: use the same binary weights
+moran_car <- moran.test(tor_sf$car_resid, lwB_queen, zero.policy = TRUE)
+print(moran_car)
+
+map_resid(tor_sf, "car_resid", "CAR Residuals")
+
+# =========================================================
+# 4) Model comparison table (AIC)
+# =========================================================
+comp_tbl <- tibble(
+  model = c("OLS", "SAR Error (SEM)", "SAR Lag (SLM)", "SAR Lag-Error (SAC)", "CAR"),
+  AIC = c(AIC(mod_lm), AIC(mod_sem), AIC(mod_slm), AIC(mod_sac), AIC(mod_car))
+) |>
+  arrange(AIC)
+
+print(comp_tbl)
+
+# =========================================================
+# 5) LM tests (HW4-style)
+# Suggests whether lag or error is more appropriate
+# =========================================================
+lm_tests <- lm.LMtests(
+  mod_lm,
+  lw_queen,
+  test = c("LMerr","LMlag","RLMerr","RLMlag"),
+  zero.policy = TRUE
+)
+print(lm_tests)
+
+```
+
+
+
