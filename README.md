@@ -71,7 +71,7 @@ Neighbourhood-level demographic and socioeconomic indicators used to examine pot
 
 > **Important:** These results represent neighbourhood-level associations and should not be interpreted as causal relationships.
 
-![Kernel Density Estimation](figures/fig4.png)
+![Kernel Density Estimation](figures/fig7.png)
 ![Hotspot Analysis](figures/fig15.png)
 ---
 
