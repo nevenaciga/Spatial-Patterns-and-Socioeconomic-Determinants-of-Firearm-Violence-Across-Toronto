@@ -73,6 +73,26 @@ Neighbourhood-level demographic and socioeconomic indicators used to examine pot
 
 ---
 
+## Key Visualizations
+
+### Spatial Distribution of Firearm Incidents
+
+![Shooting Incidents](figures/fig1.png)
+
+### Kernel Density Estimation (KDE)
+
+![KDE Map](figures/fig4.png)
+
+### Local Moran's I (LISA) Cluster Map
+
+![LISA Map](figures/fig7.png)
+
+### Model Residual Diagnostics
+
+![Residual Maps](figures/fig8.png)
+
+---
+
 ## Repository Structure
 
 ```text
