@@ -74,24 +74,12 @@ Neighbourhood-level demographic and socioeconomic indicators used to examine pot
 ## Repository Structure
 
 ```text
-Spatial-Patterns-and-Socioeconomic-Determinants-of-Firearm-Violence-Across-Toronto/
-│
-├── data/
-│   ├── Shooting_and_Firearm_Discharges_Open_Data.csv
-│   ├── neighbourhood-profiles-2021.csv
-│   └── Toronto_Neighbourhoods.*
-│
-├── report/
-│   ├── STA2016_Final_Project_Report.pdf
-│   └── main.tex
-│
-├── scripts/
-│   └── STA2016_Final_Project.Rmd
-│
-├── README.md
-└── .gitignore
+├── analysis/      # R Markdown analysis and code
+├── data/          # Raw datasets and shapefiles
+├── figures/       # Maps, KDE plots, hotspot maps, regression diagnostics
+├── report/        # Final report and LaTeX source
+└── README.md
 ```
-
 ---
 
 ## Software and Packages
