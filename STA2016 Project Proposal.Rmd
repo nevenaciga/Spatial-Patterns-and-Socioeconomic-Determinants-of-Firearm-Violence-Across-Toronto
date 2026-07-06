@@ -1,0 +1,544 @@
+---
+title: "Spatial Patterns and Socioeconomic Determinants of Firearm Violence Across Toronto"
+author: "Nevena Ciganovic"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
+# Libraries used throughout
+library(dplyr); library(readr); library(tidyr); library(stringr); library(janitor)
+library(sf); library(leaflet); library(htmltools); library(scales)
+
+# Key cleaner used for joining names
+clean_key <- function(x) {
+  x |>
+    as.character() |> str_squish() |>
+    stringi::stri_trans_general("Latin-ASCII") |>
+    tolower() |>
+    str_replace_all("&", " and ") |>
+    str_replace_all("[^a-z0-9]+", "_") |>
+    str_replace_all("^_|_$", "")
+}
+
+```
+
+## Introduction
+
+The safety of urban communities is a significant issue for politicians, residents, and scholars, as it reflects not only how well the police do their jobs, but also the underlying social and spatial patterns of the neighborhoods in which people reside. Violent crimes, particularly those involving firearms, are a major factor that influences the safety of a community. We are constantly witnessing or hearing incidents on the news, social media, or among social circles. These types of crime, however, does not occur at random. Violent incidents tend to cluster in relation to neighborhood characteristics, land use, mobility patterns, and socioeconomic conditions. 
+
+Toronto, with its densely populated and diverse urban landscape, offers a great framework for analyzing the impact of social structure and spatial characteristics on crime trends. By examining these trends using spatial tools, this project aims to identify areas in Toronto where instances of firearm violence escalate, determine whether these patterns are statistically significant, and look at whether neighborhood socioeconomic characteristics and observed firearm violence rates are associated. Understanding these relationships may help put public safety concerns in perspective and add to continuing talks about inequality, resource distribution, and community-level action.
+
+## Research Questions
+
+To address these concerns, this project will apply various spatial statistical techniques to uncover spatial patterns and socioeconomic determinants of crime across Toronto. Specifically, we will focus on three research questions:
+
+<ul>
+  <li><strong>RQ1: </strong>Are firearm violence incidents spatially clustered across Toronto, and where do the highest concentrations occur?</li>
+  <li><strong>RQ2: </strong>How do firearm violence rates vary across community districts, and are there statistically significant high-crime “hotspots” and low-crime “coldspots”?</li>
+  <li><strong>RQ3: </strong>How are firearm violence rates associated with neighborhood socioeconomic characteristics after accounting for spatial dependence?</li>
+</ul>
+
+## Data Description
+
+To answer the above questions of interest, we will use three publically avaiable datasets for Toronto.
+
+#### Shooting and Firearm Discharge Incidents
+
+The Shooting and Firearm Discharge Incidents is obtained from the Toronto Police Service Open Data portal and we will be using it to obtain data on firearm violence incidents, which forms the foundation of this project. This dataset contains incident-level records of firearm-related violence from the year 2004 to present. For the analysis, we will extract and use the following variables:
+
+<ul> 
+  <li><code>NEIGHBOURHOOD_158</code> — the neighbourhood in which the incident took place</li> 
+  <li><code>LAT_WGS84</code> and <code>LONG_WGS84</code> — geocoded latitude and longitude coordinates of the incident</li> 
+</ul>
+
+We map shootings as a point pattern and then aggregate counts to neighbourhoods to compute rates.
+
+#### Toronto Neighbourhood Boundaries
+
+The Toronto Neighbourhood Boundaries file is obtained from The City of Toronto Open Data portal. There are 158 official neighborhoods in Toronto, which are used for city planning and public reporting. The neighbourhood boundary shapefile provides polygon geometries, which we will use to spatially join incident points to neighbourhoods, and to construct neighbourhood-level shooting counts and rates.
+
+#### 2021 Neighbourhood Profiles
+
+Neighbourhood socioeconomic characteristics are obtained from the 2021 Neighbourhood Profiles, which summarize demographic and socioeconomic indicators from the 2021 Canadian Census at the neighbourhood level. These data allow us to examine how social context relates to variation in firearm violence. For the analysis, we will extract and use the following variables:
+
+<ul>
+  <li><code>population_total</code> — total neighbourhood population (built as <em>Total visible minority population</em> + <em>Not a visible minority</em>)</li>
+  <li><code>median_total_income</code> — median total income of household in 2020</li> 
+  <li><code>unemploy_rate</code> — unemployment rate (%)</li> 
+  <li><code>pct_visible_minority</code> — percent of residents identifying as a visible minority</li>
+  <li><code>pct_black</code> — percent of residents identifying as Black</li>
+</ul>
+
+These variables provide the denominator for shooting rates per 10,000 residents and will later be incorporated into spatial regression models to evaluate associations between neighbourhood characteristics and shooting rates.
+
+## Exploratory Data Analysis
+
+We provide three figures below that help us answer our research questions by showing where shootings occur in Toronto, how rates vary across neighbourhoods, and how these patterns relate to neighbourhood demographic characteristics.
+
+The first figure provides a visual summary of shooting and firearm discharge incidents across Toronto’s 158 neighbourhoods, with incidents shown as red points overlaid on neighbourhood boundaries. Areas with denser clusters of points indicate neighbourhoods with higher concentrations of firearm-related events.
+
+```{r build_points_and_polys, warning=F, message=F, include=F}
+setwd("/Users/nevenaciganovic/Downloads/STA2016/project")
+
+# --- Shootings (points) --------------------------------------------
+shoot <- read_csv(
+  "Shooting_and_Firearm_Discharges_Open_Data_-2630709695104719865.csv",
+  show_col_types = FALSE
+)
+
+stopifnot(all(c("LONG_WGS84","LAT_WGS84") %in% names(shoot)))
+
+shoot <- shoot |>
+  mutate(
+    LONG_WGS84 = suppressWarnings(as.numeric(LONG_WGS84)),
+    LAT_WGS84  = suppressWarnings(as.numeric(LAT_WGS84))
+  ) |>
+  filter(
+    is.finite(LONG_WGS84), is.finite(LAT_WGS84),
+    LONG_WGS84 > -90, LONG_WGS84 < -70,
+    LAT_WGS84  >  40, LAT_WGS84  <  50
+  )
+
+shoot_sf <- st_as_sf(
+  shoot, coords = c("LONG_WGS84","LAT_WGS84"),
+  crs = 4326, remove = FALSE
+)
+
+# --- Toronto Neighbourhoods (polygons) -----------------------------
+cand_paths <- c(
+  "Toronto_Neighbourhoods/Toronto_Neighbourhoods.shp",
+  "Toronto_Neighbourhoods.shp",
+  "~/Downloads/Toronto_Neighbourhoods/Toronto_Neighbourhoods.shp"
+)
+shp_path <- cand_paths[file.exists(path.expand(cand_paths))][1]
+if (is.na(shp_path)) stop("Could not find the Toronto Neighbourhoods shapefile.")
+
+neighbourhood <- st_read(shp_path, quiet = TRUE) |>
+  st_transform(4326)
+
+# Your shapefile's name field:
+name_col <- "Neighbourh"
+stopifnot(name_col %in% names(neighbourhood))
+
+# Add clean join key + pretty display name
+neighbourhood <- neighbourhood |>
+  mutate(
+    demo_name   = clean_key(.data[[name_col]]),
+    pretty_name = str_to_title(str_replace_all(demo_name, "_", " "))
+  )
+```
+
+```{r build_demo_keep,warning=F, message=F, include=FALSE}
+setwd("/Users/nevenaciganovic/Downloads/STA2016/project")
+
+# --- 2021 Neighbourhood Profiles → demo_keep -----------------------
+profiles <- read_csv("neighbourhood-profiles-2021-158-model.csv", show_col_types = FALSE) |>
+  clean_names()
+
+neigh_cols <- setdiff(names(profiles), "neighbourhood_name")
+
+long <- profiles |>
+  pivot_longer(all_of(neigh_cols), names_to = "neigh", values_to = "value_raw") |>
+  mutate(
+    indicator = str_to_lower(str_squish(neighbourhood_name)),
+    neigh     = str_to_lower(str_squish(neigh)),
+    value     = readr::parse_number(as.character(value_raw))
+  )
+
+unemp_tbl <- long |>
+  filter(str_detect(indicator, "^unemployment rate$")) |>
+  transmute(neigh, unemploy_rate = value)
+
+inc_tbl <- long |>
+  filter(str_detect(indicator, "^median total income of household in 2020")) |>
+  transmute(neigh, median_total_income = value)
+
+vismin_total <- long |>
+  filter(str_detect(indicator, "^total visible minority population$")) |>
+  transmute(neigh, vismin_total = value)
+
+not_vismin <- long |>
+  filter(str_detect(indicator, "^not a visible minority$")) |>
+  transmute(neigh, not_vismin = value)
+
+black_tbl <- long |>
+  filter(str_detect(indicator, "^black$")) |>
+  transmute(neigh, black_count = value)
+
+race <- vismin_total |>
+  full_join(not_vismin, by = "neigh") |>
+  full_join(black_tbl,  by = "neigh") |>
+  mutate(
+    population_total       = vismin_total + not_vismin,
+    pct_visible_minority   = if_else(population_total > 0, 100 * vismin_total / population_total, NA_real_),
+    pct_black              = if_else(population_total > 0, 100 * black_count   / population_total, NA_real_)
+  ) |>
+  select(neigh, population_total, pct_visible_minority, pct_black)
+
+demo_keep <- race |>
+  left_join(inc_tbl,  by = "neigh") |>
+  left_join(unemp_tbl, by = "neigh") |>
+  rename(demo_name = neigh) |>
+  mutate(demo_name = clean_key(demo_name)) |>
+  distinct(demo_name, .keep_all = TRUE)
+```
+
+
+
+```{r warning=F, message=F, echo=F}
+# --- Setup ---------------------------------------------------------
+setwd("/Users/nevenaciganovic/Downloads/STA2016/project")
+
+library(dplyr)
+library(readr)
+library(sf)
+library(leaflet)
+library(htmltools)
+
+# --- Load shootings (no year filtering) ---------------------------
+shoot <- read_csv(
+  "Shooting_and_Firearm_Discharges_Open_Data_-2630709695104719865.csv",
+  show_col_types = FALSE
+)
+
+stopifnot(all(c("LONG_WGS84", "LAT_WGS84") %in% names(shoot)))
+shoot <- shoot |>
+  filter(
+    LONG_WGS84 > -90 & LONG_WGS84 < -70,
+    LAT_WGS84  >  40 & LAT_WGS84  <  50
+  )
+
+shoot_sf <- st_as_sf(
+  shoot,
+  coords = c("LONG_WGS84", "LAT_WGS84"),
+  crs = 4326,
+  remove = FALSE
+)
+
+# --- Load Toronto Neighbourhoods (polygons) -----------------------
+cand_paths <- c(
+  "Toronto_Neighbourhoods/Toronto_Neighbourhoods.shp",
+  "Toronto_Neighbourhoods.shp",
+  "~/Downloads/Toronto_Neighbourhoods/Toronto_Neighbourhoods.shp"
+)
+shp_path <- cand_paths[file.exists(path.expand(cand_paths))][1]
+if (is.na(shp_path)) stop("Could not find the Toronto Neighbourhoods shapefile.")
+
+neighbourhood <- st_read(shp_path, quiet = TRUE) |> st_transform(4326)
+
+# Prefer a NAME-like field (not IDs)
+name_candidates <- c(
+  "Neighbourh","NEIGHBOURH","NEIGHBOURHOOD","NEIGHBOURHOOD_NAME",
+  "AREA_NAME","AREA_NAME_1","NAME","Name"
+)
+nm_col <- intersect(name_candidates, names(neighbourhood))
+if (length(nm_col) == 0) {
+  # fallback to first non-geometry column
+  nm_col <- setdiff(names(neighbourhood), attr(neighbourhood, "sf_column"))[1]
+} else {
+  nm_col <- nm_col[1]
+}
+
+lab_neigh <- ~htmlEscape(get(nm_col))
+
+# --- Map with layer toggles ---------------------------------------
+leaflet(options = leafletOptions(preferCanvas = TRUE)) |>
+  addTiles(group = "Base") |>
+
+  # Neighbourhood boundaries (hover shows NAME)
+  addPolygons(
+    data = neighbourhood, group = "Neighbourhoods",
+    label = lab_neigh,
+    weight = 1, color = "#666666",
+    fillColor = "#e6f2ff", fillOpacity = 0.15,
+    highlightOptions = highlightOptions(weight = 2, color = "#333333", bringToFront = TRUE),
+    labelOptions = labelOptions(
+      style = list("font-weight" = "600"),
+      textsize = "13px",
+      direction = "auto"
+    )
+  ) |>
+
+  # Shooting points
+  addCircleMarkers(
+    data  = shoot_sf, group = "Shootings",
+    radius = 4, stroke = FALSE, fillOpacity = 0.7,
+    fillColor = "red"
+  ) |>
+
+  # Layer control
+  addLayersControl(
+    baseGroups    = c("Base"),
+    overlayGroups = c("Neighbourhoods", "Shootings"),
+    options = layersControlOptions(collapsed = FALSE)
+  ) |>
+
+  # Fit to neighbourhood extent (stable and tidy)
+  fitBounds(
+    lng1 = st_bbox(neighbourhood)[["xmin"]], lat1 = st_bbox(neighbourhood)[["ymin"]],
+    lng2 = st_bbox(neighbourhood)[["xmax"]], lat2 = st_bbox(neighbourhood)[["ymax"]]
+  )
+
+```
+
+
+The second figure is also a map, this time displaying shooting rates per 10,000 residents, shaded by quintile to allow comparison across neighbourhoods. Darker shades indicate neighbourhoods experiencing relatively higher rates of firearm violence after accounting for population size.
+
+```{r message=FALSE, warning=FALSE, echo=F}
+library(dplyr)
+library(sf)
+library(stringr)
+library(stringi)
+library(tidyr)
+library(leaflet)
+library(htmltools)
+library(scales)
+
+# --- 1) One cleaning function used everywhere ----------------------
+clean_key <- function(x) {
+  x %>%
+    as.character() %>%
+    str_squish() %>%
+    stringi::stri_trans_general("Latin-ASCII") %>%  # strip accents
+    tolower() %>%
+    str_replace_all("&", " and ") %>%
+    str_replace_all("[^a-z0-9]+", "_") %>%
+    str_replace_all("^_|_$", "")
+}
+
+# --- 2) Build keys on BOTH sides ----------------------------------
+name_col <- "Neighbourh"   # from your shapefile
+neighbourhood <- neighbourhood %>%
+  mutate(
+    demo_name   = clean_key(.data[[name_col]]),
+    pretty_name = str_to_title(str_replace_all(demo_name, "_", " "))
+  )
+
+demo_keep <- demo_keep %>%
+  mutate(demo_name = clean_key(demo_name)) %>%   # ensure same key format
+  distinct(demo_name, .keep_all = TRUE)
+
+# --- 3) Join demographics to polygons -----------------------------
+neigh_demo <- neighbourhood %>%
+  left_join(demo_keep, by = "demo_name")
+
+# Optional: fallback to shapefile population if CSV didn’t match
+if ("Total_Popu" %in% names(neigh_demo)) {
+  neigh_demo <- neigh_demo %>%
+    mutate(population_total = coalesce(population_total, as.numeric(Total_Popu)))
+}
+
+# --- 4) Count shootings by neighbourhood (spatial join) -----------
+shoot_sf   <- st_transform(shoot_sf, st_crs(neigh_demo))
+neigh_demo <- st_make_valid(neigh_demo)
+
+shoot_counts <- st_join(
+  shoot_sf,
+  neigh_demo["demo_name"],
+  join = st_within,
+  left = FALSE
+) %>%
+  st_drop_geometry() %>%
+  count(demo_name, name = "shootings_n")
+
+neigh_demo <- neigh_demo %>%
+  left_join(shoot_counts, by = "demo_name") %>%
+  mutate(
+    shootings_n  = replace_na(shootings_n, 0),
+    rate_per_10k = if_else(is.finite(population_total) & population_total > 0,
+                           10000 * shootings_n / population_total,
+                           NA_real_)
+  )
+
+# --- 5) Choropleth (quintiles) ------------------------------------
+pal <- colorQuantile(
+  palette  = "YlOrRd",
+  domain   = neigh_demo$rate_per_10k,
+  n        = 5,
+  na.color = "#BDBDBD"
+)
+
+popup_poly <- sprintf(
+  "<b>%s</b><br/>Shootings: %s<br/>Population: %s<br/>Rate/10,000: %s",
+  neigh_demo$pretty_name,
+  comma(neigh_demo$shootings_n),
+  ifelse(is.na(neigh_demo$population_total), "NA", comma(neigh_demo$population_total)),
+  ifelse(is.finite(neigh_demo$rate_per_10k), sprintf('%.2f', neigh_demo$rate_per_10k), "NA")
+) |> lapply(HTML)
+
+leaflet(neigh_demo, options = leafletOptions(preferCanvas = TRUE)) |>
+  addTiles() |>
+  addPolygons(
+    fillColor   = ~pal(rate_per_10k),
+    fillOpacity = 0.75,
+    color       = "#555555",
+    weight      = 1,
+    opacity     = 0.9,
+    label       = ~pretty_name,   # name on hover
+    labelOptions = labelOptions(textsize = "12px", direction = "auto",
+                                style = list("font-weight" = "600")),
+    popup       = popup_poly,
+    highlightOptions = highlightOptions(weight = 2, color = "#000", bringToFront = TRUE)
+  ) |>
+  addLegend(
+    pal    = pal,
+    values = ~rate_per_10k,
+    title  = "Shootings per 10,000 (quintiles)",
+    position = "bottomright",
+    opacity = 0.8,
+    labFormat = labelFormat(digits = 2)
+  ) |>
+  fitBounds(
+    lng1 = st_bbox(neigh_demo)[["xmin"]], lat1 = st_bbox(neigh_demo)[["ymin"]],
+    lng2 = st_bbox(neigh_demo)[["xmax"]], lat2 = st_bbox(neigh_demo)[["ymax"]]
+  )
+
+
+```
+
+The final figure is a table which summarizes selected demographic characteristics for Toronto neighbourhoods, including population size, median household income, unemployment rate, and racial composition. These measures provide context for understanding neighbourhood-level patterns in firearm violence.
+
+```{r message=F, warning=F, echo=F}
+setwd("/Users/nevenaciganovic/Downloads/STA2016/project")
+
+library(dplyr)
+library(readr)
+library(tidyr)
+library(stringr)
+library(janitor)
+library(gt)
+library(scales)
+
+profiles <- read_csv("neighbourhood-profiles-2021-158-model.csv", show_col_types = FALSE) |>
+  clean_names()
+
+# Wide → long
+neigh_cols <- setdiff(names(profiles), "neighbourhood_name")
+long <- profiles |>
+  pivot_longer(all_of(neigh_cols), names_to = "neigh", values_to = "value_raw") |>
+  mutate(
+    indicator = str_to_lower(str_squish(neighbourhood_name)),
+    neigh     = str_to_lower(str_squish(neigh)),
+    value     = readr::parse_number(as.character(value_raw))
+  )
+
+# --- Exact row picks based on your grep output ---
+# Unemployment rate
+unemp_tbl <- long |>
+  filter(str_detect(indicator, "^unemployment rate$")) |>
+  transmute(neigh, unemploy_rate = value)
+
+# Median household income (2020) — per 2021 Census
+inc_tbl <- long |>
+  filter(str_detect(indicator, "^median total income of household in 2020")) |>
+  transmute(neigh, median_total_income = value)
+
+# Visible minority components (to build population + %s)
+vismin_total <- long |>
+  filter(str_detect(indicator, "^total visible minority population$")) |>
+  transmute(neigh, vismin_total = value)
+
+not_vismin <- long |>
+  filter(str_detect(indicator, "^not a visible minority$")) |>
+  transmute(neigh, not_vismin = value)
+
+black_tbl <- long |>
+  filter(str_detect(indicator, "^black$")) |>
+  transmute(neigh, black_count = value)
+
+# Build population (private households) + %VM + %Black
+race <- vismin_total |>
+  full_join(not_vismin, by = "neigh") |>
+  full_join(black_tbl, by = "neigh") |>
+  mutate(
+    population_total       = vismin_total + not_vismin,
+    pct_visible_minority   = if_else(population_total > 0, 100 * vismin_total / population_total, NA_real_),
+    pct_black              = if_else(population_total > 0, 100 * black_count   / population_total, NA_real_)
+  ) |>
+  select(neigh, population_total, pct_visible_minority, pct_black)
+
+# Final demographics table for join
+demo_keep <- race |>
+  left_join(inc_tbl,  by = "neigh") |>
+  left_join(unemp_tbl, by = "neigh") |>
+  rename(demo_name = neigh) |>
+  select(demo_name, population_total, median_total_income, unemploy_rate, pct_visible_minority, pct_black)
+
+# Make pretty table
+demo_tbl <- demo_keep %>%
+  # Keep only needed columns in the right order
+  select(
+    neighbourhood = demo_name,
+    population_total,
+    median_total_income,
+    unemploy_rate,
+    pct_visible_minority,
+    pct_black
+  ) %>%
+  # Fix names (underscores → spaces, title case)
+  mutate(
+    neighbourhood = str_replace_all(neighbourhood, "_", " "),
+    neighbourhood = str_to_title(neighbourhood)
+  )
+
+gt(demo_tbl) %>%
+  tab_header(
+    title = md("**Toronto Neighbourhood Demographics (2021)**"),
+    subtitle = md("Selected indicators from the 2021 Census")
+  ) %>%
+  cols_label(
+    neighbourhood        = "Neighbourhood",
+    population_total     = "Population",
+    median_total_income  = "Median HH Income (2020, $)",
+    unemploy_rate        = "Unemployment Rate (%)",
+    pct_visible_minority = "Visible Minority (%)",
+    pct_black            = "Black (%)"
+  ) %>%
+  fmt_number(columns = c(population_total), sep_mark = ",", decimals = 0) %>%
+  fmt_currency(columns = c(median_total_income), currency = "CAD", decimals = 0) %>%
+  fmt_number(columns = c(unemploy_rate, pct_visible_minority, pct_black), decimals = 1) %>%
+  tab_spanner(
+    label = "Race / Ethnicity",
+    columns = c(pct_visible_minority, pct_black)
+  ) %>%
+  opt_row_striping() %>%
+  tab_options(
+    table.width = px(900),
+    data_row.padding = px(6)
+  ) %>%
+  tab_source_note(md("Source: City of Toronto Neighbourhood Profiles (2021)."))
+
+```
+
+## Proposed Methods
+
+#### RQ1: Spatial Clustering of Firearm Incidents
+
+To address RQ1, we treat shooting locations as a spatial point pattern and evaluate whether their spatial arrangement differs from Complete Spatial Randomness (CSR). In the EDA section, we have already mapped the incident locations. We will use this to compute a kernel density surface to visualize areas of heightened intensity. Then, we will apply Ripley’s L-function, which compares the observed number of nearby events at varying spatial scales to what would be expected under CSR. The observed L-function will be compared to Monte Carlo simulation envelopes; clustering is indicated when the observed curve lies above the simulated range. This approach allows us to determine not only whether shootings are clustered, but also the spatial scale at which clustering is most pronounced. Note that we may apply additional point pattern spatial statistical techniques that we learn in upcoming lecture.
+
+#### RQ2: Neighbourhood Rate Variation and Hotspot Detection
+
+To address RQ2, we will work with areal data, using neighbourhood-level shooting rates (incidents per 10,000 residents). In the EDA, we have already visualized spatial variation using a quintile choropleth map. To formally assess whether high-rate and low-rate neighbourhoods cluster, we will compute Global Moran’s I to test for overall spatial autocorrelation across Toronto. If the global test indicates significant clustering, we will then apply Local Moran’s I (LISA) to identify specific neighbourhoods that form high–high (hotspots), low–low (coldspots), or spatial outlier patterns. The resulting LISA cluster map will allow us to locate statistically significant hotspots and coldspots and interpret local spatial structure rather than relying only on visual patterns.
+
+#### RQ3: Socioeconomic Predictors of Shooting Rates
+
+For RQ3, we will model neighbourhood-level shooting rates (per 10,000 residents) as a function of socioeconomic characteristics. We will begin by estimating an oridinary linear regression (OLS) with predictors including median household income, unemployment rate, and racial composition. We will then examine the residuals for spatial autocorrelation using Global Moran’s I. If residual spatial dependence is present, OLS inference would be invalid, so we will fit a spatial regression model.
+
+Specifically, we will compare two models:
+<ol>
+  <li>SAR Lag Model, which accounts for the influence of shooting rates in neighboring areas</li>
+  <li>SAR Error Model, which accounts for unobserved spatially structured influences</li>
+</ol>
+
+We will use Lagrange Multiplier tests and AIC to aid in model selection. The chosen model will enable us to evaluate the association between neighborhood socioeconomic characteristics and firearm violence rates, accounting for spatial dependence, thereby ensuring that any observed associations are not just products of geographic clustering.
+
+## References
+<ul>
+  <li>Shooting and Firearm Discharge Incidents: https://data.torontopolice.on.ca/datasets/64ddeca12da34403869968ec725e23c4_0/explore</li>
+  <li>Toronto Neighbourhood Boundaries: https://open.toronto.ca/dataset/neighbourhoods/</li>
+  <li>2021 Neighbourhood Profiles: https://open.toronto.ca/dataset/neighbourhood-profiles/</li>
+</ul>
+
