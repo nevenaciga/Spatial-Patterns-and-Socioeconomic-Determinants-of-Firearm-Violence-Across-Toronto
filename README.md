@@ -120,3 +120,7 @@ M.Sc. Statistical Sciences
 University of Toronto
 
 ---
+
+## License
+
+This repository is intended for academic and educational purposes. Data remain subject to the licensing terms of the Toronto Police Service and the City of Toronto Open Data Portal.
